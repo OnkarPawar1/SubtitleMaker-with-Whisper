@@ -3,6 +3,22 @@ import { Play, Pause, Square, Image as ImageIcon, Type, Download, Settings, Uplo
 import { FFmpeg } from '@ffmpeg/ffmpeg';
 import { fetchFile, toBlobURL } from '@ffmpeg/util';
 
+const waitForNextFrame = () => new Promise(resolve => requestAnimationFrame(() => resolve()));
+
+const getSupportedRecordingFormat = () => {
+  if (typeof MediaRecorder === 'undefined') return null;
+
+  const candidates = [
+    { mimeType: 'video/mp4;codecs=h264,aac', extension: 'mp4' },
+    { mimeType: 'video/mp4', extension: 'mp4' },
+    { mimeType: 'video/webm;codecs=vp9,opus', extension: 'webm' },
+    { mimeType: 'video/webm;codecs=vp8,opus', extension: 'webm' },
+    { mimeType: 'video/webm', extension: 'webm' },
+  ];
+
+  return candidates.find(({ mimeType }) => MediaRecorder.isTypeSupported(mimeType)) || null;
+};
+
 // --- Utility Functions ---
 const parseSRT = (data) => {
   const normalize = data.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
@@ -161,6 +177,7 @@ export default function App() {
   const [totalDuration, setTotalDuration] = useState(10000);
   const [isRecording, setIsRecording] = useState(false);
   const [recordingProgress, setRecordingProgress] = useState(0);
+  const [exportMessage, setExportMessage] = useState('');
 
   // --- NEW: Overlays & Drag State ---
   const [overlays, setOverlays] = useState([]);
@@ -201,7 +218,7 @@ export default function App() {
       const loadedFont = await fontFace.load(); document.fonts.add(loadedFont);
       setCustomFonts(prev => [...prev, { name: file.name, family: familyName }]);
       setTextStyle(prev => ({ ...prev, fontFamily: familyName }));
-    } catch (error) { alert("Failed to load font."); }
+    } catch { alert("Failed to load font."); }
   };
 
   const fetchGoogleFonts = async () => {
@@ -212,7 +229,7 @@ export default function App() {
       const data = await response.json(); if (data.error) throw new Error(data.error.message);
       const devanagariFonts = data.items.filter(font => font.subsets.includes('devanagari'));
       setFetchedGoogleFonts(devanagariFonts.length > 0 ? devanagariFonts : data.items.slice(0, 100));
-    } catch (err) { alert("Failed to fetch fonts."); } finally { setIsLoadingFonts(false); }
+    } catch { alert("Failed to fetch fonts."); } finally { setIsLoadingFonts(false); }
   };
 
   const handleSelectGoogleFont = (fontFamily) => {
@@ -422,7 +439,7 @@ export default function App() {
       ctx.filter = 'none';
       ctx.restore();
     }
-  }, [subtitles, bgType, bgImageObj, bgColor, textStyle, bgAnimation, overlays, activeOverlayId, subPos, dragMode, canvasWidth, canvasHeight]);
+  }, [subtitles, bgType, bgImageObj, bgColor, textStyle, bgAnimation, overlays, activeOverlayId, subPos, dragMode]);
 
   useEffect(() => { drawFrame(currentTime); }, [drawFrame, currentTime]);
 
@@ -465,17 +482,36 @@ export default function App() {
   };
 
   // HD MP4 Export with FFmpeg
-  const startRecording = () => {
+  const startRecording = async () => {
     if (!canvasRef.current) return;
-    if (!ffmpegLoaded) {
-      const proceed = window.confirm('FFmpeg is still loading (or failed to load). The export will be in WebM format instead of MP4.\n\nTip: Reload the page and wait a few seconds for FFmpeg to fully load before exporting.\n\nProceed with WebM export?');
+    const recordingFormat = getSupportedRecordingFormat();
+    if (!recordingFormat) {
+      alert('This browser does not support recording this canvas. Use desktop Chrome for export.');
+      return;
+    }
+
+    const isGitHubPages = window.location.hostname.endsWith('github.io');
+    const canConvertToMp4 = ffmpegLoaded && !isGitHubPages && recordingFormat.extension === 'webm';
+
+    if (!ffmpegLoaded && recordingFormat.extension === 'webm') {
+      const proceed = window.confirm('FFmpeg is not available, so the export will be downloaded as WebM.\n\nTip: GitHub Pages cannot reliably run the MP4 conversion path used locally.\n\nProceed with WebM export?');
       if (!proceed) return;
     }
+
+    if (isGitHubPages) {
+      setExportMessage('GitHub Pages export is browser-limited. Chrome works best; MP4 conversion is disabled here.');
+    } else {
+      setExportMessage('');
+    }
+
     setCurrentTime(0);
+    drawFrame(0);
     if (bgVideoRef.current) bgVideoRef.current.currentTime = 0;
     if (audioRef.current) audioRef.current.currentTime = 0;
     if (bgmRef.current) bgmRef.current.currentTime = 0;
-    setRecordingProgress(0); setIsRecording(true); setIsPlaying(true);
+    setRecordingProgress(0);
+    setIsRecording(true);
+    await waitForNextFrame();
 
     const stream = canvasRef.current.captureStream(30);
     try {
@@ -498,14 +534,23 @@ export default function App() {
       if (audioTracks.length > 0) stream.addTrack(audioTracks[0]);
     } catch (e) { console.error("Audio mixing failed", e); }
 
-    let mimeType = 'video/webm;codecs=vp9';
-    if (!MediaRecorder.isTypeSupported(mimeType)) mimeType = 'video/webm';
-    mediaRecorderRef.current = new MediaRecorder(stream, { mimeType, videoBitsPerSecond: 15000000 });
+    mediaRecorderRef.current = new MediaRecorder(stream, {
+      mimeType: recordingFormat.mimeType,
+      videoBitsPerSecond: 15000000,
+    });
     recordedChunksRef.current = [];
     mediaRecorderRef.current.ondataavailable = (e) => { if (e.data.size > 0) recordedChunksRef.current.push(e.data); };
     mediaRecorderRef.current.onstop = async () => {
-      const blob = new Blob(recordedChunksRef.current, { type: mimeType });
-      if (ffmpegLoaded) {
+      const blob = new Blob(recordedChunksRef.current, { type: recordingFormat.mimeType });
+
+      if (blob.size < 32768) {
+        setIsRecording(false);
+        setExportMessage('Export failed: the browser produced an empty recording. Use desktop Chrome on the live site or run locally.');
+        alert('Export failed: the browser produced an empty recording. Use desktop Chrome on the live site or run the app locally.');
+        return;
+      }
+
+      if (canConvertToMp4) {
         try {
           setRecordingProgress(60);
           const ffmpeg = ffmpegRef.current;
@@ -516,15 +561,22 @@ export default function App() {
           const data = await ffmpeg.readFile('output.mp4');
           const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([data.buffer], { type: 'video/mp4' }));
           a.download = `SubtitleStudio-HD-${Date.now()}.mp4`; a.click();
-        } catch (err) { console.error(err); alert('MP4 conversion failed. Downloading as WebM instead.'); dlFallback(blob); }
-      } else { dlFallback(blob); }
+        } catch (err) { console.error(err); alert('MP4 conversion failed. Downloading the recorded file instead.'); dlFallback(blob, recordingFormat.extension); }
+      } else { dlFallback(blob, recordingFormat.extension); }
       setIsRecording(false);
     };
-    mediaRecorderRef.current.start();
+    setIsPlaying(true);
+    await waitForNextFrame();
+    mediaRecorderRef.current.start(1000);
   };
 
   const stopRecording = () => { if (mediaRecorderRef.current?.state === 'recording') mediaRecorderRef.current.stop(); };
-  const dlFallback = (b) => { const a = document.createElement('a'); a.href = URL.createObjectURL(b); a.download = 'export.webm'; a.click(); };
+  const dlFallback = (b, extension = 'webm') => {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(b);
+    a.download = `SubtitleStudio-${Date.now()}.${extension}`;
+    a.click();
+  };
 
   const togglePlay = () => {
     if (currentTime >= totalDuration) { setCurrentTime(0); if (bgVideoRef.current) bgVideoRef.current.currentTime = 0; if (audioRef.current) audioRef.current.currentTime = 0; if (bgmRef.current) bgmRef.current.currentTime = 0; }
@@ -560,6 +612,12 @@ export default function App() {
           {isRecording ? `Exporting... ${Math.round(recordingProgress)}%` : 'Export HD MP4'}
         </button>
       </header>
+
+      {exportMessage && (
+        <div className="border-b border-amber-800 bg-amber-500/10 px-4 py-2 text-sm text-amber-200">
+          {exportMessage}
+        </div>
+      )}
 
       <main className="flex-1 flex flex-col lg:flex-row overflow-hidden relative">
         {bgVideoUrl && <video ref={bgVideoRef} src={bgVideoUrl} loop crossOrigin="anonymous" className="hidden" playsInline />}
