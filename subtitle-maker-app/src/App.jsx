@@ -4,6 +4,7 @@ import { FFmpeg } from '@ffmpeg/ffmpeg';
 import { fetchFile, toBlobURL } from '@ffmpeg/util';
 
 const waitForNextFrame = () => new Promise(resolve => requestAnimationFrame(() => resolve()));
+const getDesktopBridge = () => (typeof window !== 'undefined' ? window.subtitleStudio ?? null : null);
 
 const getSupportedRecordingFormat = () => {
   if (typeof MediaRecorder === 'undefined') return null;
@@ -110,6 +111,8 @@ const DEFAULT_SRT = `1
 \u092e\u0939\u093f\u0932\u093e \u0938\u0915\u094d\u0937\u092e\u0940\u0915\u0930\u0923`;
 
 export default function App() {
+  const desktopBridge = getDesktopBridge();
+  const isDesktopApp = Boolean(desktopBridge?.isDesktop);
   const canvasRef = useRef(null);
   const bgVideoRef = useRef(null);
   const audioRef = useRef(null);
@@ -126,6 +129,11 @@ export default function App() {
 
   // Load FFmpeg
   useEffect(() => {
+    if (isDesktopApp) {
+      setFfmpegLoaded(false);
+      return;
+    }
+
     (async () => {
       try {
         const baseURL = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm';
@@ -136,7 +144,18 @@ export default function App() {
         setFfmpegLoaded(true);
       } catch (e) { console.error("FFmpeg load failed", e); }
     })();
-  }, []);
+  }, [isDesktopApp]);
+
+  useEffect(() => {
+    if (!isDesktopApp) return;
+
+    desktopBridge.getExportSupport()
+      .then(setDesktopExportSupport)
+      .catch((error) => {
+        console.error('Desktop export support check failed', error);
+        setExportMessage('Desktop export support could not be verified. Raw recording save will still be attempted.');
+      });
+  }, [desktopBridge, isDesktopApp]);
 
   // --- ALL ORIGINAL STATE ---
   const [aspectRatio, setAspectRatio] = useState('16:9');
@@ -178,6 +197,11 @@ export default function App() {
   const [isRecording, setIsRecording] = useState(false);
   const [recordingProgress, setRecordingProgress] = useState(0);
   const [exportMessage, setExportMessage] = useState('');
+  const [desktopExportSupport, setDesktopExportSupport] = useState({
+    isDesktop: isDesktopApp,
+    ffmpegAvailable: false,
+    platform: null,
+  });
 
   // --- NEW: Overlays & Drag State ---
   const [overlays, setOverlays] = useState([]);
@@ -481,24 +505,62 @@ export default function App() {
     if (bgmRef.current) bgmRef.current.currentTime = newTime / 1000;
   };
 
+  const saveRecordingBlob = useCallback(async (blob, extension, preferMp4 = false) => {
+    const defaultBaseName = `SubtitleStudio-${Date.now()}`;
+
+    if (isDesktopApp) {
+      try {
+        const result = await desktopBridge.saveRecording({
+          arrayBuffer: await blob.arrayBuffer(),
+          mimeType: blob.type,
+          defaultFileName: defaultBaseName,
+          preferMp4,
+        });
+
+        if (result?.canceled) {
+          setExportMessage('Export canceled.');
+          return;
+        }
+
+        if (result?.filePath) {
+          setExportMessage(`Saved export to ${result.filePath}`);
+        }
+        return;
+      } catch (error) {
+        console.error('Desktop save failed', error);
+        setExportMessage(`Desktop export failed: ${error.message}`);
+        alert(`Desktop export failed: ${error.message}`);
+        return;
+      }
+    }
+
+    dlFallback(blob, extension);
+  }, [desktopBridge, isDesktopApp]);
+
   // HD MP4 Export with FFmpeg
   const startRecording = async () => {
     if (!canvasRef.current) return;
     const recordingFormat = getSupportedRecordingFormat();
     if (!recordingFormat) {
-      alert('This browser does not support recording this canvas. Use desktop Chrome for export.');
+      alert(isDesktopApp ? 'This Electron runtime cannot record the canvas on this machine.' : 'This browser does not support recording this canvas. Use desktop Chrome for export.');
       return;
     }
 
     const isGitHubPages = window.location.hostname.endsWith('github.io');
-    const canConvertToMp4 = ffmpegLoaded && !isGitHubPages && recordingFormat.extension === 'webm';
+    const canConvertToMp4 = isDesktopApp
+      ? desktopExportSupport.ffmpegAvailable && recordingFormat.extension === 'webm'
+      : ffmpegLoaded && !isGitHubPages && recordingFormat.extension === 'webm';
 
-    if (!ffmpegLoaded && recordingFormat.extension === 'webm') {
+    if (!isDesktopApp && !ffmpegLoaded && recordingFormat.extension === 'webm') {
       const proceed = window.confirm('FFmpeg is not available, so the export will be downloaded as WebM.\n\nTip: GitHub Pages cannot reliably run the MP4 conversion path used locally.\n\nProceed with WebM export?');
       if (!proceed) return;
     }
 
-    if (isGitHubPages) {
+    if (isDesktopApp) {
+      setExportMessage(desktopExportSupport.ffmpegAvailable
+        ? 'Desktop export will use the native save dialog and local FFmpeg conversion when needed.'
+        : 'Desktop export will save the raw recording directly because bundled FFmpeg is unavailable.');
+    } else if (isGitHubPages) {
       setExportMessage('GitHub Pages export is browser-limited. Chrome works best; MP4 conversion is disabled here.');
     } else {
       setExportMessage('');
@@ -553,16 +615,21 @@ export default function App() {
       if (canConvertToMp4) {
         try {
           setRecordingProgress(60);
-          const ffmpeg = ffmpegRef.current;
-          await ffmpeg.writeFile('input.webm', await fetchFile(blob));
-          setRecordingProgress(80);
-          await ffmpeg.exec(['-i', 'input.webm', '-c:v', 'libx264', '-crf', '18', '-preset', 'fast', '-c:a', 'aac', 'output.mp4']);
-          setRecordingProgress(100);
-          const data = await ffmpeg.readFile('output.mp4');
-          const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([data.buffer], { type: 'video/mp4' }));
-          a.download = `SubtitleStudio-HD-${Date.now()}.mp4`; a.click();
-        } catch (err) { console.error(err); alert('MP4 conversion failed. Downloading the recorded file instead.'); dlFallback(blob, recordingFormat.extension); }
-      } else { dlFallback(blob, recordingFormat.extension); }
+          if (isDesktopApp) {
+            await saveRecordingBlob(blob, recordingFormat.extension, true);
+            setRecordingProgress(100);
+          } else {
+            const ffmpeg = ffmpegRef.current;
+            await ffmpeg.writeFile('input.webm', await fetchFile(blob));
+            setRecordingProgress(80);
+            await ffmpeg.exec(['-i', 'input.webm', '-c:v', 'libx264', '-crf', '18', '-preset', 'fast', '-c:a', 'aac', 'output.mp4']);
+            setRecordingProgress(100);
+            const data = await ffmpeg.readFile('output.mp4');
+            const mp4Blob = new Blob([data.buffer], { type: 'video/mp4' });
+            await saveRecordingBlob(mp4Blob, 'mp4');
+          }
+        } catch (err) { console.error(err); alert('MP4 conversion failed. Downloading the recorded file instead.'); await saveRecordingBlob(blob, recordingFormat.extension); }
+      } else { await saveRecordingBlob(blob, recordingFormat.extension); }
       setIsRecording(false);
     };
     setIsPlaying(true);
